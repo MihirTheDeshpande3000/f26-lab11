@@ -21,31 +21,48 @@ the rows you don't use.
 
 | # | Operation | As wired today | Your call | Why (in one line) |
 |---|---|---|---|---|
-| 1 | | | | |
-| 2 | | | | |
-| 3 | | | | |
-| 4 | | | | |
-| 5 | | | | |
-| 6 | | | | |
-| 7 | | | | |
-| 8 | | | | |
+| 1 | Index a confirmed booking for search | Direct synchronous call from `BookingService.book`, before the store write | Subscribe an index handler to `booking.confirmed` | Search is a secondary view, so its outage must not prevent the reservation. |
+| 2 | Save the confirmed booking | Direct synchronous call to `store.save` in `book` | Keep it direct and synchronous | The caller needs the room to be held before receiving success. |
+| 3 | Record booking creation in the audit trail | Direct synchronous call in `book` | Keep it direct and synchronous | A successful booking must not exist without its audit record. |
+| 4 | Queue the confirmation email | `EmailConfirmationHandler` subscribes to `booking.confirmed` | Keep it on the bus | Email can follow the committed booking and should not decide whether the room is held. |
+| 5 | Generate the receipt | `ReceiptGenerator` subscribes to `booking.confirmed` | Keep it on the bus | The receipt is derived from an already-confirmed booking and may be regenerated. |
+| 6 | Schedule the reminder | `ReminderScheduler` subscribes to `booking.confirmed` and `booking.cancelled` | Keep it on the bus | Reminder state is downstream work that can follow booking state changes. |
+| 7 | Refresh dashboard statistics | `StatsUpdater` subscribes to `booking.confirmed` and `booking.cancelled` | Keep it on the bus | Dashboard freshness should not control whether a booking or cancellation succeeds. |
+| 8 | Record and pay a refund | `RefundLedger` subscribes to `refund.requested` | Keep it on the bus | Cancellation should complete even if the payment provider is temporarily unavailable. |
 
 ### Two calls in detail
 
 Pick two rows and give each a paragraph rather than a line. One of them has to
 be the operation `TICKET.md` implicates.
 
-**First operation and your call.** Describe what the caller of
-the operation needs and by when, and what a caller sees when the work it
-depends on is not available.
+**Index a confirmed booking for search.** The caller of `book` needs a durable
+room reservation back during the request; it does not need the room-finder's
+search document before that response. I would move indexing to a subscriber
+for the existing `booking.confirmed` event, which is published after the store
+write. This bus still invokes the handler synchronously, but it catches a
+handler exception, records a dead letter, and lets `publish` return. As wired
+today, an unavailable search cluster makes `indexBooking` throw
+`SearchIndexUnavailableError`, so the page or kiosk gets an error and the
+booking is never saved. With the proposed boundary, the caller gets the
+confirmed booking while failed indexing is visible for retry or repair, and
+search may be temporarily stale.
 
-**Second operation and your call.**
+**Save the confirmed booking.** The caller needs `store.save` to finish before
+`book` reports success because that write is the operation that actually holds
+the room and makes later conflict checks see it. I would therefore keep this
+call synchronous and in the request path rather than put it on the bus. If the
+store is unavailable or the write throws, the caller should receive an error
+and no confirmation should be reported or published, because the service
+cannot honestly promise the reservation until its source of truth accepts it.
 
 ### The incident
 
-**The call behind `TICKET.md`.** Name the file, the method,
-and the line of the call the incident report is about, and describe what the
-caller of that method gets back when that call throws.
+**The call behind `TICKET.md`.** In `src/service/bookingService.ts`, method
+`BookingService.book`, line 94 calls
+`this.searchIndex.indexBooking(booking, room, now)`. When that call throws,
+`book` does not catch it, so its caller gets `SearchIndexUnavailableError`
+instead of a `Booking`; execution never reaches `store.save` or the
+`booking.confirmed` publish.
 
 ---
 
