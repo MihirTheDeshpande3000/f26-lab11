@@ -67,3 +67,8 @@ paste into `EVENTS.md`. Both print the same output on every run.
 
 See the Lab 11 handout on the course page for the three milestones you show a
 TA.
+
+## Tool attribution
+
+I used OpenAI Codex (GPT-5) to read the code, edit the implementation and
+worksheet, and run the demos, tests, and typechecker.

@@ -24,6 +24,7 @@ export class RefundLedger implements Subscriber<RefundRequested> {
   readonly name = 'RefundLedger';
 
   private readonly entries: LedgerEntry[] = [];
+  private readonly recordedMessageIds = new Set<string>();
   private readonly processedMessageIds = new Set<string>();
   private readonly gateway: PaymentGateway;
 
@@ -36,14 +37,17 @@ export class RefundLedger implements Subscriber<RefundRequested> {
       return;
     }
     const event = message.payload;
-    this.entries.push({
-      entryId: `led-${this.entries.length + 1}`,
-      bookingId: event.bookingId,
-      organizer: event.organizer,
-      amountCents: event.amountCents,
-      reason: event.reason,
-      recordedAtMinute: message.publishedAtMinute,
-    });
+    if (!this.recordedMessageIds.has(message.id)) {
+      this.entries.push({
+        entryId: `led-${this.entries.length + 1}`,
+        bookingId: event.bookingId,
+        organizer: event.organizer,
+        amountCents: event.amountCents,
+        reason: event.reason,
+        recordedAtMinute: message.publishedAtMinute,
+      });
+      this.recordedMessageIds.add(message.id);
+    }
     this.gateway.refund(event.bookingId, event.amountCents);
     this.processedMessageIds.add(message.id);
   }

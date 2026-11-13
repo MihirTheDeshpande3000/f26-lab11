@@ -143,18 +143,19 @@ still had one refund message, `msg-3`, with its delivery count raised to 3.
 
 ```diff
 diff --git a/src/handlers/refundLedger.ts b/src/handlers/refundLedger.ts
-index 600ffca..39e629d 100644
+index 600ffca..2daea49 100644
 --- a/src/handlers/refundLedger.ts
 +++ b/src/handlers/refundLedger.ts
-@@ -24,6 +24,7 @@ export class RefundLedger implements Subscriber<RefundRequested> {
+@@ -24,6 +24,8 @@ export class RefundLedger implements Subscriber<RefundRequested> {
    readonly name = 'RefundLedger';
 
    private readonly entries: LedgerEntry[] = [];
++  private readonly recordedMessageIds = new Set<string>();
 +  private readonly processedMessageIds = new Set<string>();
    private readonly gateway: PaymentGateway;
 
    constructor(gateway: PaymentGateway) {
-@@ -31,6 +32,9 @@ export class RefundLedger implements Subscriber<RefundRequested> {
+@@ -31,16 +33,23 @@ export class RefundLedger implements Subscriber<RefundRequested> {
    }
 
    handle(message: Message<RefundRequested>): void {
@@ -162,11 +163,17 @@ index 600ffca..39e629d 100644
 +      return;
 +    }
      const event = message.payload;
-     this.entries.push({
-       entryId: `led-${this.entries.length + 1}`,
-@@ -41,6 +45,7 @@ export class RefundLedger implements Subscriber<RefundRequested> {
-       recordedAtMinute: message.publishedAtMinute,
-     });
++    if (!this.recordedMessageIds.has(message.id)) {
++      this.entries.push({
++        entryId: `led-${this.entries.length + 1}`,
++        bookingId: event.bookingId,
++        organizer: event.organizer,
++        amountCents: event.amountCents,
++        reason: event.reason,
++        recordedAtMinute: message.publishedAtMinute,
++      });
++      this.recordedMessageIds.add(message.id);
++    }
      this.gateway.refund(event.bookingId, event.amountCents);
 +    this.processedMessageIds.add(message.id);
    }
@@ -175,10 +182,12 @@ index 600ffca..39e629d 100644
 ```
 
 **What your fix uses to decide what to do on a second delivery, and what it
-does not protect.** It records the message id only after both the ledger write
-and payment call succeed, and skips a delivery whose id is already recorded.
-It does not protect a different message id for the same refund, a process
-restart that loses this in-memory set, or a failure between the two effects.
+does not protect.** It records the message id separately after the ledger
+write and after the payment succeeds: a retry can skip an existing ledger
+entry but still finish an unpaid refund, while a completed message skips both.
+It does not protect a different message id for the same refund, a restart that
+loses these in-memory sets, or a crash after the provider accepts payment but
+before the completed-message id is recorded.
 
 ### After your fix
 
@@ -241,9 +250,39 @@ redelivery, and two redeliveries, the ledger stays at 1 entry, the gateway at
 **The run.** Run `npm run demo:failure` and paste what the delivery left
 behind (the ledger, the provider, and the dead-letter list).
 
+```text
+npm notice run campus-reservations@1.0.0 demo:failure
+npm notice run tsx src/demos/failureDemo.ts
+armed: call 1 to the payment provider will throw
+booked bk-1001 for 8500 cents
+cancelled bk-1001, refund 8500 cents, refund message msg-3
+the cancel call itself returned: booking is cancelled
+
+=== after the failed delivery ===
+ledger entries: 1
+  led-1 bk-1001 $85.00 (cancelled more than two hours ahead)
+gateway calls: 1
+gateway settlements: 0
+money returned in total: $0.00
+dead letters: 1
+  msg-3 refund.requested attempt 1 in RefundLedger: payment provider did not answer on call 1 for bk-1001
+    failedAtMinute: 480
+    payload: {"bookingId":"bk-1001","organizer":"H. Ahmad","organizerEmail":"hahmad@example.edu","amountCents":8500,"reason":"cancelled more than two hours ahead","requestedAtMinute":480}
+
+=== bus log ===
+  msg-1 booking.confirmed deliveries=1
+  msg-2 booking.cancelled deliveries=1
+  msg-3 refund.requested deliveries=1
+
+the refund message is in the log and in the dead-letter list. Milestone 3 asks what you do with it.
+```
+
 ### Your recovery
 
-**What, if anything, the failed delivery left undone.**
+**What, if anything, the failed delivery left undone.** The handler appended
+one $85.00 ledger entry, then the provider call threw. No settlement was made,
+so the organizer was still owed the entire $85.00; the message id was not
+marked processed because the handler never reached that final step.
 
 **The option you took and its evidence.** If you redelivered the
 message, paste the state after the redelivery and the bus log line for that
@@ -251,8 +290,35 @@ message. If you left the message for a person to handle, write the runbook line
 they would follow, and name which fields of the dead-lettered message they read to
 follow it and what each one tells them.
 
+I redelivered `msg-3`. The healed provider settled the $85.00 refund, so the
+organizer received the money. The recorded-message id made the retry keep the
+first ledger entry instead of appending a duplicate, while the dead letter
+remains as the historical record of attempt 1.
+
+```text
+redelivering msg-3
+
+=== after redelivery of the failed refund message ===
+ledger entries: 1
+  led-1 bk-1001 $85.00 (cancelled more than two hours ahead)
+gateway calls: 2
+gateway settlements: 1
+  stl-1 bk-1001 $85.00
+money returned in total: $85.00
+dead letters: 1
+  msg-3 refund.requested attempt 1 in RefundLedger: payment provider did not answer on call 1 for bk-1001
+    failedAtMinute: 480
+    payload: {"bookingId":"bk-1001","organizer":"H. Ahmad","organizerEmail":"hahmad@example.edu","amountCents":8500,"reason":"cancelled more than two hours ahead","requestedAtMinute":480}
+
+=== bus log ===
+  msg-1 booking.confirmed deliveries=1
+  msg-2 booking.cancelled deliveries=1
+  msg-3 refund.requested deliveries=2
+```
+
 ### The other option
 
-**What the option you did not take would have cost.** One line, in terms of who
-does the work, when the organizer gets their money, and what has to be true for
-it to be safe.
+**What the option you did not take would have cost.** Manual triage would make
+an operator inspect the provider and issue or reconcile the refund, delay the
+organizer's money until that person acts, and be safe only after the operator
+verifies that no settlement for this booking and amount already succeeded.
